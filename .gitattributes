@@ -1,0 +1,5 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+*.parquet filter=lfs diff=lfs merge=lfs -text
+data/flywire_annotations.tsv filter=lfs diff=lfs merge=lfs -text
+data/archive/*.csv filter=lfs diff=lfs merge=lfs -text

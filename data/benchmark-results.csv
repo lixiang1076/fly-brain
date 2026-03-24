@@ -1,0 +1,2 @@
+framework,n_run,t_run,setup_time,build_time,sim_time,total_time,realtime_ratio,spikes,active_neurons,status,timestamp
+Brian2 (CPU),1,0.1,7.821,9.045,2.161,19.095,0.0463,1634,329,success,2026-03-10 09:36:43
