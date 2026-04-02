@@ -49,6 +49,21 @@ BEHAVIOR_DESCRIPTIONS = {
         'moderate': '🧹 果蝇开始梳理自己了，触角区域。',
         'weak':     '🧹 果蝇有轻微的梳理倾向。',
     },
+    'mating_acceptance': {
+        'strong':   '💕 雌蝇打开了阴道板 (VPO)！这是明确的性接受信号——vpoDN 强烈激活！',
+        'moderate': '💕 vpoDN 有活动，雌蝇可能在考虑接受交配。',
+        'weak':     '💕 vpoDN 轻微活动，雌蝇对求偶信号有微弱反应。',
+    },
+    'oviposition': {
+        'strong':   '🥚 雌蝇的产卵神经元 (oviDN) 强烈激活！产卵肌肉运动启动。',
+        'moderate': '🥚 oviDN 中等活跃，雌蝇可能在准备产卵。',
+        'weak':     '🥚 oviDN 轻微活动，产卵冲动微弱。',
+    },
+    'mating_rejection': {
+        'strong':   '🚫 雌蝇伸出产卵器 (OE)！这是明确的性拒绝信号——DNp13 强烈激活！',
+        'moderate': '🚫 DNp13 有活动，雌蝇可能在拒绝交配。',
+        'weak':     '🚫 DNp13 轻微活动，雌蝇有一点拒绝的倾向。',
+    },
 }
 
 STIMULUS_MATCH_RULES = [
@@ -75,12 +90,19 @@ STIMULUS_MATCH_RULES = [
      'hearing', None, '给果蝇听觉刺激'),
     (['闻', '嗅', 'smell', '气味', '臭', '霉', '腐', '难闻'],
      'smell_danger', None, '给果蝇闻到危险气味'),
+    (['求偶', 'courtship', '求偶歌', 'song', '脉冲歌', '正弦歌', 'pulse song', 'sine song'],
+     'courtship_song', None, '给雌蝇播放求偶歌'),
+    (['交配', 'mating', '性接受', 'vpo'],
+     'courtship_song', None, '模拟求偶歌刺激（经 JO-C 听觉通路）'),
     # Combo: 走路+看到危险
     (['走.*看', '走.*碰', '走.*危', '边走边'],
      'walk_forward', 'vision_looming', '走路时遇到视觉威胁'),
     # Combo: 走路+闻到东西
     (['走.*闻', '走.*味', '边走.*嗅'],
      'walk_forward', 'smell_danger', '走路时闻到危险气味'),
+    # Combo: 求偶歌+视觉
+    (['求偶.*看', '听.*歌.*看', '求偶.*视'],
+     'courtship_song', 'vision_looming', '求偶歌+视觉刺激同时给予'),
 ]
 
 
@@ -169,32 +191,246 @@ def format_result(result):
     return '\n'.join(lines)
 
 
+def trace_signal_paths(stim_keys, result):
+    """Trace how stimulation signal propagates through the connectome to output neurons.
+    
+    Uses BFS on the connectivity graph to find shortest paths from stimulated neurons
+    to active (and monitored) output neurons, showing intermediate cell types and
+    bottleneck synapse weights. This explains WHY certain outputs fire (or don't).
+    """
+    import pandas as pd
+    from collections import defaultdict
+    
+    atlas_path = BASE_DIR / 'neuron_atlas.json'
+    with open(atlas_path) as f:
+        atlas = json.load(f)
+    
+    annot_path = BASE_DIR / 'data' / 'flywire_annotations.tsv'
+    try:
+        annot = pd.read_csv(annot_path, sep='\t', low_memory=False)
+    except FileNotFoundError:
+        return '    (路径追踪需要 flywire_annotations.tsv 文件)'
+    
+    root2type = dict(zip(annot['root_id'], annot['cell_type']))
+    
+    # Gather stimulated neuron IDs
+    stim_ids = set()
+    for key in stim_keys:
+        stim = atlas['stimuli'].get(key, {})
+        if 'neuron_ids' in stim:
+            stim_ids.update(stim['neuron_ids'])
+        elif 'neuron_ids_groups' in stim:
+            for ids in stim['neuron_ids_groups'].values():
+                stim_ids.update(ids)
+    
+    if not stim_ids:
+        return ''
+    
+    # Load connectivity (lazy, cached)
+    con_path = BASE_DIR / 'data' / '2025_Connectivity_783.parquet'
+    try:
+        df_con = pd.read_parquet(con_path)
+    except FileNotFoundError:
+        return '    (路径追踪需要 Connectivity parquet 文件)'
+    
+    # Build forward adjacency
+    adj_fwd = defaultdict(list)
+    for _, row in df_con.iterrows():
+        adj_fwd[row['Presynaptic_ID']].append((row['Postsynaptic_ID'], row['Connectivity']))
+    
+    # Build reverse adjacency for output neurons
+    adj_bwd = defaultdict(list)
+    for _, row in df_con.iterrows():
+        adj_bwd[row['Postsynaptic_ID']].append((row['Presynaptic_ID'], row['Connectivity']))
+    
+    # Get output neuron IDs we care about
+    output_info = atlas['output_neurons']
+    output_ids = {info['id']: name for name, info in output_info.items()}
+    
+    # BFS from stim neurons, track layers
+    lines = []
+    lines.append('')
+    lines.append('🔍 信号传播路径追踪:')
+    
+    current_layer = stim_ids.copy()
+    visited = stim_ids.copy()
+    hop1_neurons = {}  # id -> incoming weight from stim
+    
+    max_hops = 4
+    reached_outputs = {}  # output_name -> (hop, weight)
+    
+    for hop in range(1, max_hops + 1):
+        next_layer = set()
+        layer_weights = defaultdict(float)
+        
+        for pre in current_layer:
+            for post, w in adj_fwd.get(pre, []):
+                if post not in visited:
+                    next_layer.add(post)
+                    layer_weights[post] += w
+        
+        visited |= next_layer
+        
+        if hop == 1:
+            hop1_neurons = dict(layer_weights)
+        
+        # Check which output neurons reached
+        for nid in next_layer:
+            if nid in output_ids:
+                oname = output_ids[nid]
+                if oname not in reached_outputs:
+                    reached_outputs[oname] = (hop, layer_weights[nid])
+        
+        # Layer summary
+        layer_types = defaultdict(int)
+        for nid in next_layer:
+            ct = root2type.get(nid, '?')
+            if pd.isna(ct):
+                ct = '?'
+            layer_types[ct] += 1
+        top3 = sorted(layer_types.items(), key=lambda x: -x[1])[:5]
+        top3_str = ', '.join(f'{ct}({n})' for ct, n in top3)
+        
+        lines.append(f'    第{hop}级: {len(next_layer)}个神经元被激活 | 主要类型: {top3_str}')
+        
+        current_layer = next_layer
+        if not next_layer:
+            break
+    
+    # Report output neuron reachability
+    lines.append('')
+    output_activity = result.get('output_neuron_activity', {})
+    
+    # Group outputs by behavior type for cleaner display
+    behavior_groups = {
+        '运动': ['P9_oDN1_left', 'P9_oDN1_right', 'MDN_1', 'MDN_2', 'MDN_3', 'MDN_4',
+                  'DNa01_right', 'DNa01_left', 'DNa02_right', 'DNa02_left'],
+        '逃跑': ['Giant_Fiber_1', 'Giant_Fiber_2'],
+        '进食': ['MN9_left', 'MN9_right'],
+        '梳理': ['aDN1_right', 'aDN1_left'],
+        '性接受': ['vpoDN_right', 'vpoDN_left'],
+        '产卵': ['oviDNa_right', 'oviDNa_left', 'oviDNa_b_right', 'oviDNa_b_left',
+                  'oviDNb_right', 'oviDNb_left'],
+        '性拒绝': ['DNp13_left', 'DNp13_right'],
+    }
+    
+    lines.append('    输出神经元可达性:')
+    for group_name, members in behavior_groups.items():
+        group_reached = []
+        group_fired = []
+        for m in members:
+            if m in reached_outputs:
+                hop, w = reached_outputs[m]
+                group_reached.append((m, hop, w))
+            act = output_activity.get(m, {})
+            if act.get('rate_hz', 0) > 0:
+                group_fired.append((m, act['rate_hz']))
+        
+        if group_reached:
+            hops = set(h for _, h, _ in group_reached)
+            weights = [w for _, _, w in group_reached]
+            max_w = max(weights)
+            hop_str = '/'.join(str(h) for h in sorted(hops))
+            
+            if group_fired:
+                fire_str = ', '.join(f'{n}={r:.0f}Hz' for n, r in group_fired)
+                lines.append(f'      ✅ {group_name}: 第{hop_str}级可达 (最大权重{max_w:.0f}) → 实际放电: {fire_str}')
+            else:
+                lines.append(f'      ⚠️  {group_name}: 第{hop_str}级可达 (最大权重{max_w:.0f}) → 但权重不足以驱动放电')
+        else:
+            lines.append(f'      ❌ {group_name}: {max_hops}级内不可达')
+    
+    # For reproductive neurons, show specific paths if they were reached
+    repro_neurons = ['vpoDN_right', 'vpoDN_left', 'DNp13_left', 'DNp13_right',
+                     'oviDNa_right', 'oviDNa_left', 'oviDNb_right', 'oviDNb_left']
+    repro_reached = [n for n in repro_neurons if n in reached_outputs]
+    
+    if repro_reached and any('courtship' in k or 'hearing' in k for k in stim_keys):
+        lines.append('')
+        lines.append('    🔬 生殖行为通路详情:')
+        
+        # Find specific intermediary neurons for vpoDN
+        for oname in ['vpoDN_right', 'vpoDN_left']:
+            if oname not in reached_outputs:
+                continue
+            oid = output_info[oname]['id']
+            
+            # Get direct inputs to this output neuron
+            direct_inputs = {}
+            for pre, w in adj_bwd.get(oid, []):
+                direct_inputs[pre] = w
+            
+            # Which direct inputs are reachable from hop1?
+            bridges = []
+            for mid2, w_to_out in direct_inputs.items():
+                for mid1_pre, w_mid in adj_bwd.get(mid2, []):
+                    if mid1_pre in hop1_neurons:
+                        mid1_type = root2type.get(mid1_pre, '?')
+                        mid2_type = root2type.get(mid2, '?')
+                        if pd.isna(mid1_type): mid1_type = '?'
+                        if pd.isna(mid2_type): mid2_type = '?'
+                        bottleneck = min(hop1_neurons[mid1_pre], w_mid, w_to_out)
+                        bridges.append({
+                            'mid1_type': mid1_type,
+                            'mid2_type': mid2_type,
+                            'w1': hop1_neurons[mid1_pre],
+                            'w2': w_mid,
+                            'w3': w_to_out,
+                            'bottleneck': bottleneck
+                        })
+            
+            if bridges:
+                bridges.sort(key=lambda x: -x['bottleneck'])
+                side = oname.split('_')[-1]
+                lines.append(f'      {oname}: 前3条最强通路 (JO-C → mid1 → mid2 → vpoDN):')
+                for i, b in enumerate(bridges[:3]):
+                    lines.append(f'        {i+1}. →[{b["w1"]:.0f}]→ {b["mid1_type"]} →[{b["w2"]:.0f}]→ {b["mid2_type"]} →[{b["w3"]:.0f}]→ vpoDN  (瓶颈={b["bottleneck"]:.0f})')
+                
+                # Explain why it didn't fire
+                max_bottleneck = bridges[0]['bottleneck']
+                act = output_activity.get(oname, {})
+                if act.get('rate_hz', 0) == 0:
+                    lines.append(f'        💡 瓶颈权重仅{max_bottleneck:.0f}，LIF模型中不足以驱动vpoDN放电')
+                    lines.append(f'           这正是 connectome-constrained optimization 要解决的问题')
+    
+    lines.append('')
+    return '\n'.join(lines)
+
+
 def print_help():
     print("""
-╔══════════════════════════════════════════════════════╗
-║      🪰  果蝇大脑对话系统 (带学习功能) 🧠           ║
-╠══════════════════════════════════════════════════════╣
-║                                                      ║
-║  感觉刺激:                                           ║
-║  🍬 味觉:  "给果蝇尝甜的" / "让它尝尝苦的"         ║
-║  🦶 运动:  "让果蝇走路" / "让果蝇后退"             ║
-║  🚀 逃跑:  "拍果蝇" / "有危险"                     ║
-║  🧹 梳理:  "让果蝇梳理触角"                         ║
-║  👁  视觉:  "让果蝇看到黑影"                        ║
-║  👂 听觉:  "给果蝇听声音"                           ║
-║  👃 嗅觉:  "让果蝇闻到臭味"                         ║
-║                                                      ║
-║  🧠 学习 (多巴胺调节):                              ║
-║  ⚡ "电击"    - 惩罚! 果蝇学会回避上次的刺激        ║
-║  🍰 "奖励"    - 奖赏! 果蝇学会喜欢上次的刺激       ║
-║  📋 "记忆"    - 查看果蝇学到了什么                   ║
-║  🔄 "失忆"    - 清除所有记忆                         ║
-║                                                      ║
-║  组合: "让果蝇边走边看到危险"                        ║
-║  关闭: "关掉视觉" + 其他指令                         ║
-║                                                      ║
-║  命令: help / list / quit                            ║
-╚══════════════════════════════════════════════════════╝
+╔══════════════════════════════════════════════════════════╗
+║      🪰  果蝇大脑对话系统 (带学习功能) 🧠               ║
+╠══════════════════════════════════════════════════════════╣
+║                                                          ║
+║  感觉刺激:                                               ║
+║  🍬 味觉:  "给果蝇尝甜的" / "让它尝尝苦的"             ║
+║  🦶 运动:  "让果蝇走路" / "让果蝇后退"                 ║
+║  🚀 逃跑:  "拍果蝇" / "有危险"                         ║
+║  🧹 梳理:  "让果蝇梳理触角"                             ║
+║  👁  视觉:  "让果蝇看到黑影"                            ║
+║  👂 听觉:  "给果蝇听声音"                               ║
+║  👃 嗅觉:  "让果蝇闻到臭味"                             ║
+║  💕 求偶歌: "播放求偶歌" / "courtship song"             ║
+║                                                          ║
+║  🧬 雌蝇生殖行为输出 (新增):                            ║
+║  💕 vpoDN  → 性接受 (VPO, vaginal plate opening)        ║
+║  🥚 oviDN  → 产卵 (oviposition)                        ║
+║  🚫 DNp13  → 性拒绝 (OE, ovipositor extrusion)         ║
+║                                                          ║
+║  🧠 学习 (多巴胺调节):                                  ║
+║  ⚡ "电击"    - 惩罚! 果蝇学会回避上次的刺激            ║
+║  🍰 "奖励"    - 奖赏! 果蝇学会喜欢上次的刺激           ║
+║  📋 "记忆"    - 查看果蝇学到了什么                       ║
+║  🔄 "失忆"    - 清除所有记忆                             ║
+║                                                          ║
+║  组合: "让果蝇边走边看到危险" / "求偶歌+视觉"           ║
+║  关闭: "关掉视觉" + 其他指令                             ║
+║                                                          ║
+║  🔍 每次仿真后自动追踪信号传播路径，解释结果成因        ║
+║                                                          ║
+║  命令: help / list / quit                                ║
+╚══════════════════════════════════════════════════════════╝
 """)
 
 
@@ -354,6 +590,14 @@ def main():
             )
             last_result = result  # Save for learning
             print(format_result(result))
+
+            # Trace signal propagation paths
+            try:
+                trace = trace_signal_paths(stim_keys, result)
+                if trace:
+                    print(trace)
+            except Exception as e:
+                print(f'    (路径追踪出错: {e})')
 
             # Show KC info if available
             if 'mushroom_body' in result:

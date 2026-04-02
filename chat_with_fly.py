@@ -99,6 +99,9 @@ def analyze_results(spk_trn, output_map, duration_sec, atlas, df_comp):
         'escape': 0,
         'feeding': 0,
         'grooming': 0,
+        'mating_acceptance': 0,
+        'oviposition': 0,
+        'mating_rejection': 0,
     }
 
     for name, act in output_activity.items():
@@ -116,6 +119,12 @@ def analyze_results(spk_trn, output_map, duration_sec, atlas, df_comp):
                 behavior_scores['feeding'] += r
             elif 'aDN1' in name:
                 behavior_scores['grooming'] += r
+            elif 'vpoDN' in name:
+                behavior_scores['mating_acceptance'] += r
+            elif 'oviDN' in name:
+                behavior_scores['oviposition'] += r
+            elif 'DNp13' in name:
+                behavior_scores['mating_rejection'] += r
 
     # Sort behaviors by score
     for beh, score in sorted(behavior_scores.items(), key=lambda x: -x[1]):
